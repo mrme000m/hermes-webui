@@ -171,6 +171,20 @@ function mobileSwitchPanel(name){
   }
 }
 
+/* ── Sidebar collapse (desktop) ── */
+function toggleSidebar(){
+  const layout=document.querySelector('.layout');
+  if(!layout)return;
+  const collapsed=layout.classList.toggle('sidebar-collapsed');
+  localStorage.setItem('hermes-sidebar-collapsed', collapsed?'1':'0');
+}
+function _restoreSidebarState(){
+  const layout=document.querySelector('.layout');
+  if(!layout)return;
+  const saved=localStorage.getItem('hermes-sidebar-collapsed');
+  if(saved==='1') layout.classList.add('sidebar-collapsed');
+}
+
 $('btnSend').onclick=()=>{
   if(window._micActive){
     window._micPendingSend=true;
@@ -468,6 +482,13 @@ $('msg').addEventListener('input',()=>{
     if(typeof ensureSkillCommandsLoadedForAutocomplete==='function') ensureSkillCommandsLoadedForAutocomplete();
   } else {
     hideCmdDropdown();
+  }
+});
+$('msg').addEventListener('focus',()=>{
+  const layout=document.querySelector('.layout');
+  if(layout&&!layout.classList.contains('sidebar-collapsed')){
+    layout.classList.add('sidebar-collapsed');
+    try{localStorage.setItem('hermes-sidebar-collapsed','1');}catch(e){}
   }
 });
 $('msg').addEventListener('keydown',e=>{
@@ -821,6 +842,7 @@ function applyBotName(){
     }
     applyBotName();
   }catch(e){
+    console.warn('[sidebar-density] boot settings fetch failed, using defaults');
     window._sendKey='enter';
     window._showTokenUsage=false;
     window._showCliSessions=false;
@@ -870,6 +892,8 @@ function applyBotName(){
   await loadWorkspaceList();
   await loadOnboardingWizard();
   _initResizePanels();
+  _restoreSidebarState();
+  if(typeof initTradingUX==='function') initTradingUX();
   // Workspace panel restore happens AFTER loadSession so we know if
   // the session has a workspace — prevents the snap-open-then-closed flash (#576).
   // Fix #822: clear any browser-restored value before first render. This

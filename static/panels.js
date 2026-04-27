@@ -167,10 +167,17 @@ async function switchPanel(name, opts = {}) {
   if (nextPanel === 'memory') await loadMemory();
   if (nextPanel === 'workspaces') await loadWorkspacesPanel();
   if (nextPanel === 'profiles') await loadProfilesPanel();
+  if (nextPanel === 'presets') loadPresetsPanel();
   if (nextPanel === 'todos') loadTodos();
   if (nextPanel === 'settings') {
     switchSettingsSection(_currentSettingsSection);
     loadSettingsPanel();
+  }
+  // Auto-expand sidebar if collapsed so panel content is visible
+  const layout = document.querySelector('.layout');
+  if (layout && layout.classList.contains('sidebar-collapsed')) {
+    layout.classList.remove('sidebar-collapsed');
+    try { localStorage.setItem('hermes-sidebar-collapsed', '0'); } catch (e) {}
   }
   syncAppTitlebar();
   return true;
@@ -666,8 +673,20 @@ function renderSkills(skills) {
     for (const skill of items.sort((a,b) => a.name.localeCompare(b.name))) {
       const el = document.createElement('div');
       el.className = 'skill-item';
-      el.innerHTML = `<span class="skill-name">${esc(skill.name)}</span><span class="skill-desc">${esc(skill.description||'')}</span>`;
-      el.onclick = () => openSkill(skill.name, el);
+      el.dataset.skillName = skill.name;
+      el.innerHTML = `
+        <span class="skill-name">${esc(skill.name)}</span>
+        <span class="skill-desc">${esc(skill.description||'')}</span>
+        <span class="skill-actions" onclick="event.stopPropagation();">
+          <button class="skill-action-btn" title="Delete skill" onclick="deleteSkillFromList('${esc(skill.name)}', this)" aria-label="Delete skill">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          </button>
+        </span>
+      `;
+      el.onclick = (e) => {
+        if (e.target.closest('.skill-actions')) return;
+        openSkill(skill.name, el);
+      };
       sec.appendChild(el);
     }
     box.appendChild(sec);
@@ -934,6 +953,49 @@ async function deleteCurrentSkill() {
   } catch(e) { setStatus(t('error_prefix') + e.message); }
 }
 
+async function deleteSkillFromList(name, btn) {
+  const ok = await showConfirmDialog({
+    title: t('delete_title') || 'Delete',
+    message: `Delete skill "${name}"?`,
+    confirmLabel: t('delete_title') || 'Delete',
+    danger: true,
+    focusCancel: true,
+  });
+  if (!ok) return;
+  try {
+    await api('/api/skills/delete', { method:'POST', body: JSON.stringify({ name }) });
+    // Remove from data
+    _skillsData = (_skillsData || []).filter(s => s.name !== name);
+    _currentSkillDetail = null;
+    _skillPreFormDetail = null;
+    _cronSkillsCache = null;
+    _skillMode = 'empty';
+    const body = $('skillDetailBody');
+    const empty = $('skillDetailEmpty');
+    const title = $('skillDetailTitle');
+    if (body) { body.innerHTML = ''; body.style.display = 'none'; }
+    if (empty) empty.style.display = '';
+    if (title) title.textContent = '';
+    _setSkillHeaderButtons('empty');
+    // Animate removal
+    const item = btn.closest('.skill-item');
+    if (item) {
+      item.style.transition = 'all .25s cubic-bezier(.22,1,.36,1)';
+      item.style.opacity = '0';
+      item.style.transform = 'translateX(-20px)';
+      item.style.maxHeight = item.offsetHeight + 'px';
+      setTimeout(() => {
+        item.style.maxHeight = '0';
+        item.style.padding = '0 10px';
+        item.style.margin = '0';
+        item.style.overflow = 'hidden';
+        setTimeout(() => item.remove(), 250);
+      }, 250);
+    }
+    showToast(t('skill_deleted') || 'Skill deleted');
+  } catch(e) { setStatus(t('error_prefix') + e.message); }
+}
+
 // ── Memory (main view) ──
 let _memoryData = null;
 let _currentMemorySection = null; // 'memory' | 'user'
@@ -1173,7 +1235,21 @@ function syncWorkspaceDisplays(){
   if(!hasWorkspace && composerDropdown) composerDropdown.classList.remove('open');
   // Only show workspace label once boot has finished to prevent
   // flash of "No workspace" before the saved session finishes loading.
-  if(composerLabel) composerLabel.textContent=S._bootReady?label:'';
+  if(composerLabel){
+    const symLabel = (typeof getWorkspaceActiveSymbol === 'function' && S._bootReady)
+      ? getWorkspaceActiveSymbol().replace('USDT','')
+      : '';
+    const scope = (typeof getWorkspaceSymbolScope === 'function' && S._bootReady)
+      ? getWorkspaceSymbolScope()
+      : null;
+    const catIcon = scope ? (
+      scope.category === 'gold' ? '🥇' :
+      scope.category === 'fx' ? '💱' :
+      scope.category === 'commodities' ? '🛢️' :
+      scope.category === 'crypto' ? '◈' : '◆'
+    ) : '';
+    composerLabel.textContent = S._bootReady ? (symLabel ? `${catIcon} ${symLabel} · ${label}` : label) : '';
+  }
   if(composerChip){
     composerChip.disabled=!hasWorkspace;
     composerChip.title=hasWorkspace?ws:t('no_workspace');
@@ -1353,6 +1429,32 @@ function _renderWorkspaceDetail(ws){
     ? `<span class="detail-badge active">${esc(t('profile_active'))}</span>`
     : `<span class="detail-badge">Inactive</span>`;
   const defaultBadge = isDefault ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
+
+  // Symbol scope (client-side, from trading-ux.js helpers)
+  let symbolScopeHtml = '';
+  if (typeof getWorkspaceSymbolScope === 'function') {
+    const scope = getWorkspaceSymbolScope(ws.path);
+    const syms = scope.symbols || [];
+    const activeSym = (typeof getWorkspaceActiveSymbol === 'function') ? getWorkspaceActiveSymbol() : (syms[0] || '—');
+    const presetLabel = (scope.category && typeof _WS_SYMBOL_PRESETS !== 'undefined' && _WS_SYMBOL_PRESETS[scope.category])
+      ? _WS_SYMBOL_PRESETS[scope.category].label
+      : (scope.category || 'Custom');
+    const symPills = syms.slice(0, 12).map(s => {
+      const isActiveSym = s === activeSym;
+      return `<span class="ws-sym-pill${isActiveSym ? ' active' : ''}" onclick="if(typeof setActiveSymbol==='function')setActiveSymbol('${esc(s)}')" title="Set active">${esc(s.replace('USDT',''))}${isActiveSym ? ' ◆' : ''}</span>`;
+    }).join('');
+    const more = syms.length > 12 ? ` <span class="ws-sym-pill muted">+${syms.length - 12} more</span>` : '';
+    symbolScopeHtml = `
+      <div class="detail-card">
+        <div class="detail-card-title">Symbol Scope <span class="detail-badge">${esc(presetLabel)}</span></div>
+        <div class="detail-row"><div class="detail-row-label">Active</div><div class="detail-row-value"><strong>${esc(activeSym)}</strong></div></div>
+        <div class="ws-sym-grid">${symPills}${more}</div>
+        <div style="margin-top:8px">
+          <button class="panel-head-btn" onclick="_openWorkspaceSymbolEditor('${esc(ws.path)}')" style="font-size:11px">⚙️ Configure symbols</button>
+        </div>
+      </div>`;
+  }
+
   body.innerHTML = `
     <div class="main-view-content">
       <div class="detail-card">
@@ -1361,6 +1463,7 @@ function _renderWorkspaceDetail(ws){
         <div class="detail-row"><div class="detail-row-label">Path</div><div class="detail-row-value"><code>${esc(ws.path)}</code></div></div>
         <div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value">${statusBadge}${defaultBadge}</div></div>
       </div>
+      ${symbolScopeHtml}
     </div>`;
   body.style.display = '';
   if (empty) empty.style.display = 'none';
@@ -1384,7 +1487,7 @@ function _setWorkspaceHeaderButtons(mode, ws){
     show(editBtn);
     if (isDefault) hide(delBtn); else show(delBtn);
     hide(cancelBtn); hide(saveBtn);
-  } else if (mode === 'create' || mode === 'edit') {
+  } else if (mode === 'create' || mode === 'edit' || mode === 'edit-symbols') {
     hide(actBtn); hide(editBtn); hide(delBtn); show(cancelBtn); show(saveBtn);
   } else {
     [actBtn, editBtn, delBtn, cancelBtn, saveBtn].forEach(hide);
@@ -1419,6 +1522,99 @@ async function activateCurrentWorkspace(){
   await switchToWorkspace(_currentWorkspaceDetail.path, _currentWorkspaceDetail.name);
   // Re-render detail after activation so the active badge updates
   _renderWorkspaceDetail(_currentWorkspaceDetail);
+}
+
+function _openWorkspaceSymbolEditor(path){
+  const ws = _workspaceList.find(w => w.path === path);
+  if (!ws) return;
+  const body = $('workspaceDetailBody');
+  if (!body) return;
+  const scope = (typeof getWorkspaceSymbolScope === 'function') ? getWorkspaceSymbolScope(path) : { type:'multi', category:'crypto', symbols:[] };
+  const presets = (typeof _WS_SYMBOL_PRESETS !== 'undefined') ? _WS_SYMBOL_PRESETS : {};
+  const categories = Object.entries(presets).map(([key, p]) => {
+    const isSelected = scope.category === key;
+    return `<button type="button" class="ws-scope-chip${isSelected ? ' active' : ''}" data-cat="${esc(key)}" onclick="_selectWsSymbolCategory(this,'${esc(path)}')">
+      <span class="ws-scope-name">${esc(p.label)}</span>
+      <span class="ws-scope-count">${p.symbols.length}</span>
+    </button>`;
+  }).join('');
+
+  const customSymbols = scope.symbols.join(', ');
+
+  body.innerHTML = `
+    <div class="main-view-content">
+      <div class="detail-card">
+        <div class="detail-card-title">Symbol Scope for ${esc(ws.name || ws.path)}</div>
+        <div class="detail-form-row">
+          <label>Category</label>
+          <div class="ws-scope-grid">${categories}</div>
+        </div>
+        <div class="detail-form-row">
+          <label for="wsCustomSymbols">Custom Symbols (comma-separated)</label>
+          <textarea id="wsCustomSymbols" rows="3" placeholder="BTCUSDT, ETHUSDT, XAUUSD...">${esc(customSymbols)}</textarea>
+          <div class="detail-form-hint">Override with your own symbols, or leave blank to use the category preset.</div>
+        </div>
+        <div class="detail-form-row">
+          <label>Symbol Type</label>
+          <div class="ws-type-options">
+            <label class="ws-type-option"><input type="radio" name="wsSymbolType" value="single" ${scope.type==='single'?'checked':''}> Single symbol workspace</label>
+            <label class="ws-type-option"><input type="radio" name="wsSymbolType" value="multi" ${scope.type!=='single'?'checked':''}> Multi-symbol workspace</label>
+          </div>
+        </div>
+        <div id="wsSymbolFormError" class="detail-form-error" style="display:none"></div>
+      </div>
+    </div>`;
+
+  _workspaceMode = 'edit-symbols';
+  const actBtn = $('btnActivateWorkspaceDetail');
+  const editBtn = $('btnEditWorkspaceDetail');
+  const delBtn = $('btnDeleteWorkspaceDetail');
+  const cancelBtn = $('btnCancelWorkspaceDetail');
+  const saveBtn = $('btnSaveWorkspaceDetail');
+  if (actBtn) actBtn.style.display = 'none';
+  if (editBtn) editBtn.style.display = 'none';
+  if (delBtn) delBtn.style.display = 'none';
+  if (cancelBtn) { cancelBtn.style.display = ''; cancelBtn.onclick = () => _renderWorkspaceDetail(ws); }
+  if (saveBtn) { saveBtn.style.display = ''; saveBtn.onclick = () => _saveWorkspaceSymbols(path); }
+}
+
+function _selectWsSymbolCategory(btn, path){
+  document.querySelectorAll('.ws-scope-chip').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function _saveWorkspaceSymbols(path){
+  const selectedCat = document.querySelector('.ws-scope-chip.active');
+  const category = selectedCat ? selectedCat.dataset.cat : 'custom';
+  const customEl = document.getElementById('wsCustomSymbols');
+  const customRaw = customEl ? customEl.value.trim() : '';
+  const typeEl = document.querySelector('input[name="wsSymbolType"]:checked');
+  const type = typeEl ? typeEl.value : 'multi';
+  const errEl = document.getElementById('wsSymbolFormError');
+  if (errEl) errEl.style.display = 'none';
+
+  let symbols = [];
+  if (customRaw) {
+    symbols = customRaw.split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+  } else if (typeof _WS_SYMBOL_PRESETS !== 'undefined' && _WS_SYMBOL_PRESETS[category]) {
+    symbols = [..._WS_SYMBOL_PRESETS[category].symbols];
+  }
+  if (!symbols.length) {
+    if (errEl) { errEl.textContent = 'Please select a category or enter at least one symbol.'; errEl.style.display = ''; }
+    return;
+  }
+  if (typeof setWorkspaceSymbolScope === 'function') {
+    setWorkspaceSymbolScope(path, { type, category, symbols });
+  }
+  const ws = _workspaceList.find(w => w.path === path);
+  if (ws) _renderWorkspaceDetail(ws);
+  // Signal Trading Pro to refresh — new scope may invalidate current symbol
+  if (typeof getWorkspaceActiveSymbol === 'function') {
+    const newSym = getWorkspaceActiveSymbol();
+    if (typeof setActiveSymbol === 'function') setActiveSymbol(newSym);
+    else if (typeof _updateComposerWorkspaceLabel === 'function') _updateComposerWorkspaceLabel();
+  }
+  showToast('Symbol scope saved', 2000);
 }
 
 async function deleteCurrentWorkspace(){
@@ -2151,16 +2347,16 @@ let _settingsSection = 'conversation';
 let _currentSettingsSection = 'conversation';
 
 function switchSettingsSection(name){
-  const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='system')?name:'conversation';
+  const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='mcp'||name==='system')?name:'conversation';
   _settingsSection=section;
   _currentSettingsSection=section;
-  const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',system:'System'};
+  const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',mcp:'Mcp',system:'System'};
   // Sidebar menu items
   document.querySelectorAll('#settingsMenu .side-menu-item').forEach(it=>{
     it.classList.toggle('active', it.dataset.settingsSection===section);
   });
   // Panes in main
-  ['conversation','appearance','preferences','providers','system'].forEach(key=>{
+  ['conversation','appearance','preferences','providers','mcp','system'].forEach(key=>{
     const pane=$('settingsPane'+map[key]);
     if(pane) pane.classList.toggle('active', key===section);
   });
@@ -2169,6 +2365,7 @@ function switchSettingsSection(name){
   if(dd && dd.value!==section) dd.value=section;
   // Lazy-load providers when the tab is opened
   if(section==='providers') loadProvidersPanel();
+  if(section==='mcp') loadMcpServersPanel();
 }
 
 function _syncHermesPanelSessionActions(){
@@ -2629,6 +2826,306 @@ function _setSettingsAuthButtonsVisible(active){
   if(disableBtn) disableBtn.style.display=active?'':'none';
 }
 
+// ── MCP Servers panel ───────────────────────────────────────────────────────
+
+let _mcpServersData = [];
+let _mcpServerFormMode = 'create'; // 'create' | 'edit'
+let _mcpServerEditingName = null;
+
+async function loadMcpServersPanel(){
+  const list=$('mcpServersList');
+  const empty=$('mcpServersEmpty');
+  if(!list) return;
+  try{
+    const data=await api('/api/mcp/servers');
+    _mcpServersData=data.servers||[];
+    list.innerHTML='';
+    if(_mcpServersData.length===0){
+      list.style.display='none';
+      if(empty) empty.style.display='';
+      return;
+    }
+    if(empty) empty.style.display='none';
+    list.style.display='flex';
+    for(const s of _mcpServersData){
+      list.appendChild(_buildMcpServerCard(s));
+    }
+  }catch(e){
+    list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load MCP servers: '+esc(e.message)+'</div>';
+  }
+}
+
+function _buildMcpServerCard(s){
+  const card=document.createElement('div');
+  card.className='provider-card mcp-server-card';
+  if(s.enabled===false) card.classList.add('mcp-disabled');
+  card.dataset.name=s.name;
+  const typeLabel=s.type==='http'?'HTTP':'stdio';
+  const typeBadgeClass=s.type==='http'?'mcp-type-http':'mcp-type-stdio';
+  const detailText=s.type==='http'?(s.url||''):((s.command||'')+' '+(s.args||[]).join(' '));
+
+  // Status badge
+  let statusBadge='';
+  if(s.enabled===false){
+    statusBadge='<span class="mcp-status-badge mcp-status-disabled">Disabled</span>';
+  }else if(typeof s.connected==='boolean'){
+    statusBadge=s.connected
+      ?`<span class="mcp-status-badge mcp-status-connected">${s.tools_count||0} tools</span>`
+      :'<span class="mcp-status-badge mcp-status-error">Disconnected</span>';
+  }
+
+  const header=document.createElement('button');
+  header.type='button';
+  header.className='provider-card-header';
+  header.innerHTML=`
+    <div class="provider-card-info">
+      <div class="provider-card-name">${esc(s.name)} <span class="mcp-type-badge ${typeBadgeClass}">${typeLabel}</span>${statusBadge}</div>
+      <div class="provider-card-meta">${esc(detailText)}</div>
+    </div>
+    <svg class="provider-card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" width="16" height="16"><path d="M6 9l6 6 6-6"/></svg>
+  `;
+  card.appendChild(header);
+
+  const body=document.createElement('div');
+  body.className='provider-card-body';
+
+  // Details
+  const details=document.createElement('div');
+  details.className='mcp-server-details';
+  if(s.type==='http'){
+    details.innerHTML=`<div class="mcp-detail-row"><span>URL</span><code>${esc(s.url||'')}</code></div>`;
+    if(s.headers && Object.keys(s.headers).length){
+      details.innerHTML+=`<div class="mcp-detail-row"><span>Headers</span><code>${esc(JSON.stringify(s.headers))}</code></div>`;
+    }
+  }else{
+    details.innerHTML=`<div class="mcp-detail-row"><span>Command</span><code>${esc(s.command||'')}</code></div>`;
+    if(s.args && s.args.length){
+      details.innerHTML+=`<div class="mcp-detail-row"><span>Args</span><code>${esc(JSON.stringify(s.args))}</code></div>`;
+    }
+    if(s.env && Object.keys(s.env).length){
+      details.innerHTML+=`<div class="mcp-detail-row"><span>Env</span><code>${esc(JSON.stringify(s.env))}</code></div>`;
+    }
+  }
+  if(s.tools_include && s.tools_include.length){
+    details.innerHTML+=`<div class="mcp-detail-row"><span>Tools include</span><code>${esc(s.tools_include.join(', '))}</code></div>`;
+  }
+  if(s.tools_exclude && s.tools_exclude.length){
+    details.innerHTML+=`<div class="mcp-detail-row"><span>Tools exclude</span><code>${esc(s.tools_exclude.join(', '))}</code></div>`;
+  }
+  body.appendChild(details);
+
+  // Actions
+  const actions=document.createElement('div');
+  actions.className='mcp-server-actions';
+  actions.innerHTML=`
+    <button type="button" class="mcp-action-btn mcp-action-test" onclick="testMcpServer('${esc(s.name)}')">Test</button>
+    <button type="button" class="mcp-action-btn mcp-action-edit" onclick="editMcpServer('${esc(s.name)}')">Edit</button>
+    <button type="button" class="mcp-action-btn mcp-action-delete" onclick="deleteMcpServer('${esc(s.name)}')">Delete</button>
+  `;
+  body.appendChild(actions);
+
+  card.appendChild(body);
+  header.addEventListener('click',()=>card.classList.toggle('open'));
+  return card;
+}
+
+function openMcpServerForm(mode='create', serverData=null){
+  const wrap=$('mcpServerFormWrap');
+  if(!wrap) return;
+  _mcpServerFormMode=mode;
+  _mcpServerEditingName=mode==='edit'?(serverData&&serverData.name?serverData.name:null):null;
+  const isEdit=mode==='edit';
+  const s=serverData||{};
+  const typeVal=s.type||'stdio';
+  const enabledVal=s.enabled!==false;
+  const title=isEdit?'Edit MCP Server':'Add MCP Server';
+
+  wrap.innerHTML=`
+    <div class="mcp-form-card">
+      <div class="mcp-form-title">${esc(title)}</div>
+      <form class="detail-form" onsubmit="event.preventDefault(); saveMcpServerForm();">
+        <div class="detail-form-row">
+          <label for="mcpFormName">Name</label>
+          <input type="text" id="mcpFormName" value="${esc(isEdit?s.name:'')}" placeholder="e.g. filesystem" autocomplete="off" ${isEdit?'disabled':''} required>
+        </div>
+        <div class="detail-form-row">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="mcpFormEnabled" ${enabledVal?'checked':''} style="width:15px;height:15px;accent-color:var(--accent)">
+            <span>Enabled</span>
+          </label>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">Disabled servers are kept in config but not connected.</div>
+        </div>
+        <div class="detail-form-row">
+          <label for="mcpFormType">Type</label>
+          <select id="mcpFormType" onchange="_toggleMcpFormFields()">
+            <option value="stdio" ${typeVal==='stdio'?'selected':''}>stdio (local subprocess)</option>
+            <option value="http" ${typeVal==='http'?'selected':''}>HTTP (remote endpoint)</option>
+          </select>
+        </div>
+        <div id="mcpFormStdioFields">
+          <div class="detail-form-row">
+            <label for="mcpFormCommand">Command</label>
+            <input type="text" id="mcpFormCommand" value="${esc(s.command||'')}" placeholder="e.g. npx" autocomplete="off">
+          </div>
+          <div class="detail-form-row">
+            <label for="mcpFormArgs">Arguments (JSON array)</label>
+            <input type="text" id="mcpFormArgs" value="${esc(s.args?JSON.stringify(s.args):'')}" placeholder='["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]' autocomplete="off">
+          </div>
+          <div class="detail-form-row">
+            <label for="mcpFormEnv">Environment variables (JSON object)</label>
+            <input type="text" id="mcpFormEnv" value="${esc(s.env?JSON.stringify(s.env):'')}" placeholder='{"GITHUB_TOKEN": "***"}' autocomplete="off">
+          </div>
+        </div>
+        <div id="mcpFormHttpFields" style="display:none">
+          <div class="detail-form-row">
+            <label for="mcpFormUrl">URL</label>
+            <input type="text" id="mcpFormUrl" value="${esc(s.url||'')}" placeholder="https://mcp.example.com/mcp" autocomplete="off">
+          </div>
+          <div class="detail-form-row">
+            <label for="mcpFormHeaders">Headers (JSON object)</label>
+            <input type="text" id="mcpFormHeaders" value="${esc(s.headers?JSON.stringify(s.headers):'')}" placeholder='{"Authorization": "Bearer ***"}' autocomplete="off">
+          </div>
+        </div>
+        <div class="detail-form-row">
+          <label for="mcpFormToolsInclude">Tools include (comma-separated)</label>
+          <input type="text" id="mcpFormToolsInclude" value="${esc(s.tools_include?s.tools_include.join(', '):'')}" placeholder="tool1, tool2" autocomplete="off">
+          <div class="detail-form-hint">Only expose these tools from the server. Leave blank to expose all.</div>
+        </div>
+        <div class="detail-form-row">
+          <label for="mcpFormToolsExclude">Tools exclude (comma-separated)</label>
+          <input type="text" id="mcpFormToolsExclude" value="${esc(s.tools_exclude?s.tools_exclude.join(', '):'')}" placeholder="tool3, tool4" autocomplete="off">
+          <div class="detail-form-hint">Hide these tools from the server. Include takes precedence.</div>
+        </div>
+        <div id="mcpFormError" class="detail-form-error" style="display:none"></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button type="submit" class="sm-btn" style="flex:1;font-weight:600">${esc(isEdit?'Save Changes':'Add Server')}</button>
+          <button type="button" class="sm-btn" onclick="closeMcpServerForm()" style="font-weight:600">Cancel</button>
+        </div>
+      </form>
+    </div>
+  `;
+  wrap.style.display='';
+  _toggleMcpFormFields();
+  const nameEl=$('mcpFormName');
+  if(nameEl && !isEdit) nameEl.focus();
+}
+
+function _toggleMcpFormFields(){
+  const type=$('mcpFormType');
+  const stdio=$('mcpFormStdioFields');
+  const http=$('mcpFormHttpFields');
+  if(!type||!stdio||!http) return;
+  const isHttp=type.value==='http';
+  stdio.style.display=isHttp?'none':'';
+  http.style.display=isHttp?'':'none';
+}
+
+function closeMcpServerForm(){
+  const wrap=$('mcpServerFormWrap');
+  if(wrap){wrap.innerHTML='';wrap.style.display='none';}
+  _mcpServerFormMode='create';
+  _mcpServerEditingName=null;
+}
+
+async function saveMcpServerForm(){
+  const nameEl=$('mcpFormName');
+  const typeEl=$('mcpFormType');
+  const errEl=$('mcpFormError');
+  if(!nameEl||!typeEl||!errEl) return;
+  const name=nameEl.value.trim();
+  const type=typeEl.value;
+  errEl.style.display='none';
+  if(!name){errEl.textContent='Name is required';errEl.style.display='';return;}
+
+  const payload={name,type,enabled:!!($('mcpFormEnabled')||{}).checked};
+  if(type==='http'){
+    const url=($('mcpFormUrl')||{}).value.trim();
+    if(!url){errEl.textContent='URL is required for HTTP servers';errEl.style.display='';return;}
+    payload.url=url;
+    const headersRaw=($('mcpFormHeaders')||{}).value.trim();
+    if(headersRaw){
+      try{payload.headers=JSON.parse(headersRaw);}catch(e){errEl.textContent='Headers must be valid JSON';errEl.style.display='';return;}
+    }
+  }else{
+    const command=($('mcpFormCommand')||{}).value.trim();
+    if(!command){errEl.textContent='Command is required for stdio servers';errEl.style.display='';return;}
+    payload.command=command;
+    const argsRaw=($('mcpFormArgs')||{}).value.trim();
+    if(argsRaw){
+      try{payload.args=JSON.parse(argsRaw);if(!Array.isArray(payload.args))throw new Error();}catch(e){errEl.textContent='Arguments must be a JSON array';errEl.style.display='';return;}
+    }
+    const envRaw=($('mcpFormEnv')||{}).value.trim();
+    if(envRaw){
+      try{payload.env=JSON.parse(envRaw);if(typeof payload.env!=='object'||Array.isArray(payload.env))throw new Error();}catch(e){errEl.textContent='Environment variables must be a JSON object';errEl.style.display='';return;}
+    }
+  }
+  const includeRaw=($('mcpFormToolsInclude')||{}).value.trim();
+  if(includeRaw){
+    payload.tools_include=includeRaw.split(',').map(s=>s.trim()).filter(Boolean);
+  }
+  const excludeRaw=($('mcpFormToolsExclude')||{}).value.trim();
+  if(excludeRaw){
+    payload.tools_exclude=excludeRaw.split(',').map(s=>s.trim()).filter(Boolean);
+  }
+
+  try{
+    await api('/api/mcp/servers/save',{method:'POST',body:JSON.stringify(payload)});
+    showToast(_mcpServerFormMode==='edit'?'MCP server updated':'MCP server added');
+    closeMcpServerForm();
+    await reloadMcpServers();
+    await loadMcpServersPanel();
+  }catch(e){
+    errEl.textContent=e.message||'Failed to save MCP server';
+    errEl.style.display='';
+  }
+}
+
+async function deleteMcpServer(name){
+  const ok=await showConfirmDialog({title:'Delete MCP Server',message:`Delete "${name}"?`,confirmLabel:'Delete',danger:true,focusCancel:true});
+  if(!ok) return;
+  try{
+    await api('/api/mcp/servers/delete',{method:'POST',body:JSON.stringify({name})});
+    showToast('MCP server deleted');
+    await reloadMcpServers();
+    await loadMcpServersPanel();
+  }catch(e){showToast('Error: '+e.message,4000);}
+}
+
+async function reloadMcpServers(){
+  try{
+    showToast('Reloading MCP servers…');
+    const res=await api('/api/mcp/servers/reload',{method:'POST'});
+    const connected=(res.status||[]).filter(s=>s.connected).length;
+    const total=(res.status||[]).length;
+    showToast(`MCP servers reloaded — ${connected}/${total} connected`);
+    await loadMcpServersPanel();
+  }catch(e){showToast('Reload failed: '+e.message,4000);}
+}
+
+async function testMcpServer(name){
+  const server=_mcpServersData.find(s=>s.name===name);
+  if(!server) return;
+  showToast('Testing MCP server…');
+  try{
+    const payload={
+      type:server.type,
+      ...(server.type==='http'?{url:server.url,headers:server.headers}:{command:server.command,args:server.args})
+    };
+    const res=await api('/api/mcp/servers/test',{method:'POST',body:JSON.stringify(payload)});
+    if(res.ok){
+      showToast(res.note||'MCP server connection OK');
+    }else{
+      showToast('Test failed: '+(res.error||'Unknown error'),4000);
+    }
+  }catch(e){showToast('Test error: '+e.message,4000);}
+}
+
+function editMcpServer(name){
+  const server=_mcpServersData.find(s=>s.name===name);
+  if(!server) return;
+  openMcpServerForm('edit',server);
+}
+
 function _applySavedSettingsUi(saved, body, opts){
   const {sendKey,showTokenUsage,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
@@ -2659,7 +3156,14 @@ function _applySavedSettingsUi(saved, body, opts){
   if(body.default_model) window._defaultModel=body.default_model;
   renderMessages();
   if(typeof syncTopbar==='function') syncTopbar();
-  if(typeof renderSessionList==='function') renderSessionList();
+  // Re-render session list so sidebar density change is visible immediately
+  if(typeof renderSessionListFromCache==='function'){
+    console.log('[sidebar-density] calling renderSessionListFromCache');
+    renderSessionListFromCache();
+  }else if(typeof renderSessionList==='function'){
+    console.log('[sidebar-density] calling renderSessionList');
+    renderSessionList();
+  }
 }
 
 async function checkUpdatesNow(){
@@ -2779,6 +3283,83 @@ async function saveSettings(andClose){
   }catch(e){
     showToast(t('settings_save_failed')+e.message);
   }
+}
+
+async function resetWebAppCache(){
+  const ok=await showConfirmDialog({
+    title:'Reset web app cache?',
+    message:'This clears service worker caches and local browser storage for this app, then reloads the page. Use this when UI code changes are not reflecting.',
+    confirmLabel:'Reset & reload',
+    danger:true,
+    focusCancel:true,
+  });
+  if(!ok) return;
+
+  const btn=$('btnResetWebCache');
+  if(btn){
+    btn.disabled=true;
+    btn.textContent='Resetting...';
+  }
+
+  const errors=[];
+  try{
+    if('serviceWorker' in navigator){
+      const regs=await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r)=>r.unregister()));
+    }
+  }catch(e){
+    errors.push('service worker');
+  }
+
+  try{
+    if('caches' in window){
+      const keys=await caches.keys();
+      await Promise.all(keys.map((k)=>caches.delete(k)));
+    }
+  }catch(e){
+    errors.push('cache storage');
+  }
+
+  try{
+    sessionStorage.clear();
+  }catch(e){
+    errors.push('session storage');
+  }
+
+  try{
+    localStorage.clear();
+  }catch(e){
+    errors.push('local storage');
+  }
+
+  // IndexedDB is occasionally used by browser-level caches/libraries.
+  // Best effort only; not all browsers implement indexedDB.databases().
+  try{
+    if(window.indexedDB&&typeof indexedDB.databases==='function'){
+      const dbs=await indexedDB.databases();
+      await Promise.all((dbs||[]).map((db)=>{
+        if(!db||!db.name) return Promise.resolve();
+        return new Promise((resolve)=>{
+          const req=indexedDB.deleteDatabase(db.name);
+          req.onsuccess=()=>resolve();
+          req.onerror=()=>resolve();
+          req.onblocked=()=>resolve();
+        });
+      }));
+    }
+  }catch(e){
+    errors.push('indexeddb');
+  }
+
+  if(errors.length){
+    showToast(`Cache reset completed with warnings (${errors.join(', ')}). Reloading...`, 3500);
+  }else{
+    showToast('Web app cache reset complete. Reloading...', 1500);
+  }
+
+  const next=new URL(location.href);
+  next.searchParams.set('_cache_reset', String(Date.now()));
+  location.replace(next.toString());
 }
 
 async function signOut(){

@@ -938,6 +938,7 @@ function renderSessionListFromCache(){
     titleRow.appendChild(ts);
     sessionText.appendChild(titleRow);
     const density=(window._sidebarDensity==='detailed'?'detailed':'compact');
+    console.log('[sidebar-density] render session', s.session_id?.slice(0,8), 'density:', density);
     if(density==='detailed'){
       const metaBits=[];
       const msgCount=typeof s.message_count==='number'?s.message_count:0;
@@ -1065,6 +1066,12 @@ function renderSessionListFromCache(){
         }
         await loadSession(s.session_id);renderSessionListFromCache();
         if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+        // Auto-expand sidebar if collapsed so user sees their selection in context
+        const layout=document.querySelector('.layout');
+        if(layout&&layout.classList.contains('sidebar-collapsed')){
+          layout.classList.remove('sidebar-collapsed');
+          try{localStorage.setItem('hermes-sidebar-collapsed','0');}catch(e){}
+        }
       }, 300);
     };
     return el;
