@@ -1201,8 +1201,11 @@ function _buildComposerOverlay() {
       if (e.key === 'Escape') { hideDock(); return; }
       // Dock keyboard shortcuts — only when composer is focused
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
+        const key = e.key.toLowerCase();
+        // Never intercept standard browser editing shortcuts (copy, paste, cut, select-all, undo, redo)
+        if (['c','v','x','a','z','y'].includes(key)) return;
         const map = { l: 'long', s: 'short', a: 'analyze', v: 'validate', m: 'multi', e: 'enhance' };
-        const action = map[e.key.toLowerCase()];
+        const action = map[key];
         if (action) {
           e.preventDefault();
           if (action === 'enhance') enhancePrompt();
