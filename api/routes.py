@@ -75,6 +75,7 @@ from api.config import (
     get_reasoning_status,
     set_reasoning_display,
     set_reasoning_effort,
+    get_cohere_api_key,
 )
 from api.helpers import (
     require,
@@ -745,6 +746,23 @@ def handle_get(handler, parsed) -> bool:
             pass
         return j(handler, settings)
 
+    # ── MCP Servers (GET) ──
+    if parsed.path == "/api/mcp/servers":
+        from api.config import get_mcp_servers
+        servers = get_mcp_servers()
+        # Include runtime connection status when available
+        try:
+            from tools.mcp_tool import get_mcp_status
+            status_map = {s["name"]: s for s in get_mcp_status()}
+            for s in servers:
+                st = status_map.get(s["name"])
+                if st:
+                    s["connected"] = st.get("connected", False)
+                    s["tools_count"] = st.get("tools", 0)
+        except Exception:
+            pass
+        return j(handler, {"servers": servers})
+
     if parsed.path == "/api/reasoning":
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
@@ -1114,6 +1132,68 @@ def handle_get(handler, parsed) -> bool:
     return False  # 404
 
 
+# ── Trading: Cohere enhance proxy ────────────────────────────────────────────
+
+def handle_trading_enhance(handler, body: dict) -> bool:
+    """Proxy Cohere v2/chat requests so the API key never touches the client."""
+    api_key = get_cohere_api_key()
+    if not api_key:
+        return j(handler, {"error": "COHERE_API_KEY not configured"}, status=503)
+
+    system_prompt = body.get("system_prompt", "")
+    user_content = body.get("user_content", "")
+    if not user_content:
+        return bad(handler, "user_content is required")
+
+    import urllib.request
+    import urllib.error
+
+    payload = json.dumps({
+        "model": "command-a-03-2025",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.cohere.com/v2/chat",
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8")[:500]
+        logger.warning("Cohere proxy HTTP %s: %s", e.code, body_text)
+        return j(handler, {"error": f"Cohere API error {e.code}", "detail": body_text}, status=502)
+    except Exception as e:
+        logger.warning("Cohere proxy failed: %s", e)
+        return j(handler, {"error": f"Cohere proxy failed: {e}"}, status=502)
+
+    # Extract text from Cohere v2 response
+    text = None
+    if isinstance(data.get("message", {}).get("content"), list):
+        text = "".join(c.get("text", "") for c in data["message"]["content"] if isinstance(c, dict))
+    elif isinstance(data.get("message", {}).get("content"), str):
+        text = data["message"]["content"]
+    elif isinstance(data.get("text"), str):
+        text = data["text"]
+
+    if not text or not text.strip():
+        logger.warning("Cohere proxy: empty text in response. Keys: %s", list(data.keys()))
+        return j(handler, {"error": "Empty response from Cohere"}, status=502)
+
+    return j(handler, {"enhanced": text.strip()})
+
+
 # ── POST routes ───────────────────────────────────────────────────────────────
 
 
@@ -1169,6 +1249,47 @@ def handle_post(handler, parsed) -> bool:
         result = remove_provider_key(provider_id)
         if not result.get("ok"):
             return bad(handler, result.get("error", "Unknown error"))
+        return j(handler, result)
+
+    # ── MCP Servers (POST) ──
+    if parsed.path == "/api/mcp/servers/save":
+        from api.config import save_mcp_server
+        name = (body.get("name") or "").strip()
+        if not name:
+            return bad(handler, "name is required")
+        try:
+            result = save_mcp_server(name, body)
+            return j(handler, result)
+        except ValueError as e:
+            return bad(handler, str(e))
+        except RuntimeError as e:
+            return bad(handler, str(e), 500)
+
+    if parsed.path == "/api/mcp/servers/delete":
+        from api.config import delete_mcp_server
+        name = (body.get("name") or "").strip()
+        if not name:
+            return bad(handler, "name is required")
+        try:
+            result = delete_mcp_server(name)
+            return j(handler, result)
+        except ValueError as e:
+            return bad(handler, str(e))
+        except RuntimeError as e:
+            return bad(handler, str(e), 500)
+
+    # ── Trading: Cohere enhance proxy ──
+    if parsed.path == "/api/trading/enhance":
+        return handle_trading_enhance(handler, body)
+
+    if parsed.path == "/api/mcp/servers/test":
+        return _handle_mcp_server_test(handler, body)
+
+    if parsed.path == "/api/mcp/servers/reload":
+        from api.config import reload_mcp_servers
+        result = reload_mcp_servers()
+        if not result.get("ok"):
+            return bad(handler, result.get("error", "Failed to reload MCP servers"))
         return j(handler, result)
 
     if parsed.path == "/api/reasoning":
@@ -3682,6 +3803,75 @@ def _handle_session_import_cli(handler, body):
             "imported": True,
         },
     )
+
+
+def _handle_mcp_server_test(handler, body):
+    """Test connectivity for an MCP server configuration."""
+    import shutil
+    import urllib.request
+    import urllib.error
+
+    server_type = str(body.get("type", "stdio")).strip().lower()
+
+    if server_type == "http":
+        url = str(body.get("url", "")).strip()
+        if not url:
+            return bad(handler, "URL is required")
+        headers = body.get("headers") or {}
+        req = urllib.request.Request(
+            url,
+            headers={str(k): str(v) for k, v in headers.items()},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return j(handler, {"ok": True, "status": resp.status, "type": "http"})
+        except urllib.error.HTTPError as e:
+            # HTTP errors (4xx, 5xx) still mean the server is reachable
+            return j(handler, {"ok": True, "status": e.code, "type": "http", "note": "Server responded with HTTP error (this is normal for MCP endpoints)"})
+        except Exception as e:
+            return j(handler, {"ok": False, "error": str(e), "type": "http"})
+    else:
+        command = str(body.get("command", "")).strip()
+        if not command:
+            return bad(handler, "Command is required")
+        found = shutil.which(command)
+        if not found:
+            return j(handler, {"ok": False, "error": f"Command '{command}' not found in PATH", "type": "stdio"})
+        # Optionally try to spawn the process and check it starts
+        args = body.get("args") or []
+        full_args = [command] + [str(a) for a in args if a is not None]
+        try:
+            import subprocess
+            proc = subprocess.Popen(
+                full_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+            )
+            # Give it a moment to start, then terminate
+            import time as _time
+            _time.sleep(0.5)
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return j(handler, {"ok": True, "command": found, "type": "stdio", "note": "Process started successfully"})
+            else:
+                stdout, stderr = proc.communicate(timeout=1)
+                exit_code = proc.returncode
+                stderr_text = stderr.decode("utf-8", errors="replace")[:500] if stderr else ""
+                # Exit code 0 immediately might mean it printed help and exited
+                # Exit code non-zero might be an error
+                if exit_code == 0:
+                    return j(handler, {"ok": True, "command": found, "type": "stdio", "note": "Process ran and exited cleanly (may need arguments to stay alive)"})
+                else:
+                    return j(handler, {"ok": False, "error": f"Process exited with code {exit_code}", "stderr": stderr_text, "type": "stdio"})
+        except Exception as e:
+            return j(handler, {"ok": False, "error": str(e), "type": "stdio"})
 
 
 def _handle_session_import(handler, body):

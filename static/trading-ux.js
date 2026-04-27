@@ -102,7 +102,6 @@ let _selectedTradingSkill = null;
 let _selectedSkills = new Set(); // persisted to localStorage — only TV-Pine scripts
 let _customPresets = [];        // persisted to localStorage
 let _mcpServers = [];           // fetched from /api/mcp/servers
-let _cohereApiKey = '';
 let _symbolFavorites = new Set(); // persisted to localStorage
 let _symbolRecent = [];          // persisted to localStorage — last 8 symbols
 let _symbolFilter = '';          // active search filter
@@ -280,12 +279,6 @@ function _loadPersistedState() {
   if (_selectedSkills.size !== savedSkills.length) _saveSelectedSkills();
 
   _customPresets = _safeGetJson('trading-custom-presets', []);
-  try {
-    _cohereApiKey = localStorage.getItem('trading-cohere-key') || '';
-  } catch (e) {
-    console.warn('[TradingUX] Cannot read cohere key from localStorage:', e);
-    _cohereApiKey = '';
-  }
   _symbolFavorites = new Set(_safeGetJson('trading-symbol-favorites', []));
   _symbolRecent = _safeGetJson('trading-symbol-recent', []);
 }
@@ -320,7 +313,6 @@ function _buildTradingUI() {
   _buildComposerOverlay();
   // Symbol bar removed — symbols now live in workspace scope
   _buildPresetEditorModal();
-  _buildCohereSettingsModal();
 }
 
 function _injectTradingCSS() {
@@ -708,9 +700,8 @@ function _renderSetupTab() {
     <div class="trading-section-title">Prompt Presets</div>
     <button class="trading-setup-btn" onclick="${presetsClick}">📝 Preset Studio</button>
     <div class="trading-section-title">Cohere Enhance</div>
-    <button class="trading-setup-btn" onclick="openCohereSettings()">🔑 API Key</button>
     <div style="font-size:11px;color:var(--muted);line-height:1.5;margin-top:4px">
-      Set your Cohere API key to enable the ✨ Enhance button in the composer.
+      Set <code>COHERE_API_KEY</code> as an environment variable (or in <code>~/.hermes/.env</code>) to enable the ✨ Enhance button.
     </div>
     <div class="trading-section-title">Data</div>
     <button class="trading-setup-btn" onclick="_resetTradingData()" style="color:var(--error)">🗑 Reset All Data</button>
@@ -721,10 +712,8 @@ function _resetTradingData() {
   if (!confirm('Reset all Trading Pro settings?')) return;
   _selectedSkills.clear();
   _customPresets = [];
-  _cohereApiKey = '';
   localStorage.removeItem('trading-selected-skills');
   localStorage.removeItem('trading-custom-presets');
-  localStorage.removeItem('trading-cohere-key');
   _renderTradeTab();
   _renderSkillsTab();
   showToast('Trading Pro data reset', 2000);
@@ -1254,50 +1243,33 @@ function quickAction(action) {
 
 /* ─────────────────────────  COHERE AUTO-ENHANCE  ───────────────────────── */
 
-// Shared Cohere v2/chat client. Never logs the API key.
-async function callCohere(systemPrompt, userContent, apiKey) {
-  console.log('[TradingUX] callCohere: sending request…');
-  const res = await fetch('https://api.cohere.com/v2/chat', {
+// Shared Cohere enhance proxy — key lives server-side via COHERE_API_KEY env var.
+async function callCohere(systemPrompt, userContent) {
+  console.log('[TradingUX] callCohere: proxying via /api/trading/enhance…');
+  const res = await fetch('/api/trading/enhance', {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      model: 'command-a-03-2025',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent }
-      ]
+      system_prompt: systemPrompt,
+      user_content: userContent
     })
   });
 
   console.log('[TradingUX] callCohere: response status', res.status);
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    console.error('[TradingUX] callCohere: error body:', body.slice(0, 500));
-    throw new Error(`Cohere ${res.status}: ${body.slice(0, 200)}`);
-  }
-
   const data = await res.json();
-  console.log('[TradingUX] callCohere: response keys:', Object.keys(data));
-
-  // Cohere v2 returns message.content as an array of content parts
-  // Each part has { type: 'text', text: '...' }
-  let text = null;
-  if (Array.isArray(data.message?.content)) {
-    text = data.message.content.map(c => c.text || '').join('');
-  } else if (typeof data.message?.content === 'string') {
-    text = data.message.content;
-  } else if (typeof data.text === 'string') {
-    text = data.text;
+  if (!res.ok) {
+    const msg = data.error || `HTTP ${res.status}`;
+    console.error('[TradingUX] callCohere: proxy error:', msg);
+    throw new Error(msg);
   }
 
-  console.log('[TradingUX] callCohere: extracted text length:', text?.length);
+  const text = data.enhanced;
+  console.log('[TradingUX] callCohere: enhanced length:', text?.length);
   if (!text || !text.trim()) {
-    console.error('[TradingUX] callCohere: empty text, full response:', JSON.stringify(data, null, 2).slice(0, 1000));
     throw new Error('Empty response from Cohere');
   }
   return text.trim();
@@ -1316,15 +1288,6 @@ async function enhancePrompt() {
   if (!msgInput.value.trim()) {
     console.log('[TradingUX] composer empty');
     showToast('Type a prompt first, then click Enhance', 3000);
-    return;
-  }
-
-  const apiKey = _cohereApiKey;
-  console.log('[TradingUX] apiKey length:', apiKey ? apiKey.length : 0);
-  if (!apiKey) {
-    console.log('[TradingUX] no api key');
-    showToast('Set Cohere API key in Trading Pro → Enhance Settings', 4000);
-    openCohereSettings();
     return;
   }
 
@@ -1367,7 +1330,7 @@ Enhancement rules:
 Original prompt to enhance:`;
 
     console.log('[TradingUX] calling Cohere…');
-    const enhanced = await callCohere(systemPrompt, currentPrompt, apiKey);
+    const enhanced = await callCohere(systemPrompt, currentPrompt);
     console.log('[TradingUX] Cohere response length:', enhanced.length);
     setComposerValue(enhanced);
     showToast('✨ Prompt enhanced by Cohere', 3000);
@@ -1615,85 +1578,6 @@ function _closePresetModal() {
 
 /* ─────────────────────────  COHERE SETTINGS MODAL  ───────────────────────── */
 
-function _buildCohereSettingsModal() {
-  if (document.getElementById('cohereSettingsModal')) return;
-  const overlay = document.createElement('div');
-  overlay.id = 'cohereSettingsModal';
-  overlay.className = 'trading-modal-overlay';
-  overlay.innerHTML = `
-    <div class="trading-modal" style="width:420px;max-height:85vh;display:flex;flex-direction:column">
-      <div class="trading-modal-header">
-        <div class="trading-modal-title">🔑 Cohere API Key</div>
-        <button class="trading-modal-close" onclick="_closeCohereSettings()">✕</button>
-      </div>
-      <div class="trading-modal-body" id="cohereSettingsBody" style="overflow-y:auto;flex:1">
-        <div style="margin-bottom:14px">
-          <label style="display:block;font-size:11px;font-weight:600;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em">API Key</label>
-          <input type="password" id="cohereKeyInput" placeholder="sk-..." style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--code-bg);color:var(--text);font-size:14px;font-family:inherit">
-          <div style="font-size:11px;color:var(--muted);margin-top:4px">
-            Your key is stored locally in the browser. It is never sent to the server.
-          </div>
-        </div>
-        <div style="margin-bottom:8px">
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text);cursor:pointer">
-            <input type="checkbox" id="cohereKeyShow" onchange="_toggleCohereKeyVisibility()"> Show key
-          </label>
-        </div>
-      </div>
-      <div class="trading-modal-footer" id="cohereSettingsFooter">
-        <button onclick="_closeCohereSettings()">Cancel</button>
-        <button onclick="_clearCohereKey()" style="color:var(--error)">Clear</button>
-        <button class="primary" onclick="_saveCohereKey()">Save</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(overlay);
-}
-
-function openCohereSettings() {
-  _buildCohereSettingsModal();
-  const input = document.getElementById('cohereKeyInput');
-  if (input) input.value = _cohereApiKey || '';
-  const modal = document.getElementById('cohereSettingsModal');
-  _openModal(modal, input);
-}
-
-function _closeCohereSettings() {
-  const modal = document.getElementById('cohereSettingsModal');
-  if (modal) {
-    _closeActiveModal(modal);
-    modal.classList.remove('open');
-  }
-}
-
-function _toggleCohereKeyVisibility() {
-  const input = document.getElementById('cohereKeyInput');
-  const chk = document.getElementById('cohereKeyShow');
-  if (input) input.type = chk?.checked ? 'text' : 'password';
-}
-
-function _saveCohereKey() {
-  const input = document.getElementById('cohereKeyInput');
-  const key = input?.value.trim() || '';
-  _cohereApiKey = key;
-  if (key) {
-    localStorage.setItem('trading-cohere-key', key);
-    showToast('🔑 Cohere API key saved', 2000);
-  } else {
-    localStorage.removeItem('trading-cohere-key');
-    showToast('Cohere API key cleared', 2000);
-  }
-  _closeCohereSettings();
-}
-
-function _clearCohereKey() {
-  const input = document.getElementById('cohereKeyInput');
-  if (input) input.value = '';
-  _cohereApiKey = '';
-  localStorage.removeItem('trading-cohere-key');
-  showToast('Cohere API key cleared', 2000);
-}
-
 function _duplicatePresetFromModal() {
   const labelEl = document.getElementById('pmLabel');
   const promptEl = document.getElementById('pmPrompt');
@@ -1824,13 +1708,6 @@ async function _enhancePresetModalWithCohere() {
   const instructionsEl = document.getElementById('pmCohereInstructions');
   if (!promptEl) return;
 
-  const apiKey = _cohereApiKey;
-  if (!apiKey) {
-    showToast('Set Cohere API key in Trading Pro \u2192 Enhance Settings', 4000);
-    openCohereSettings();
-    return;
-  }
-
   const currentPrompt = promptEl.value.trim();
   if (!currentPrompt) {
     showToast('Write a prompt first, then click Enhance', 3000);
@@ -1851,7 +1728,7 @@ async function _enhancePresetModalWithCohere() {
   try {
     const systemPrompt = `You are a trading prompt enhancement specialist. Your job is to improve trading-related prompt templates.\n\nAvailable TradingView Pine Script Skills:\n${skillsContext}\n\nEnhancement rules:\n1. Add specific skill names and parameters where relevant\n2. Include timeframe and symbol context (use {symbol} placeholder)\n3. Request structured output (JSON, bullet points, or clear sections)\n4. Add validation steps where appropriate\n5. Keep the original intent — do not change the user's goal\n6. Output ONLY the enhanced prompt text, no explanations\n\nUser instruction: ${instructions}\n\nOriginal prompt to enhance:`;
 
-    const enhanced = await callCohere(systemPrompt, currentPrompt, apiKey);
+    const enhanced = await callCohere(systemPrompt, currentPrompt);
     promptEl.value = enhanced;
     showToast('✨ Preset enhanced by Cohere', 3000);
 

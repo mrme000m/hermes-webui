@@ -1415,6 +1415,7 @@ def get_available_models() -> dict:
                 "MINIMAX_CN_API_KEY",
                 "XAI_API_KEY",
                 "MISTRAL_API_KEY",
+                "COHERE_API_KEY",
             ):
                 val = os.getenv(k)
                 if val:
@@ -2111,6 +2112,177 @@ if _settings_file_exists:
             )
         except Exception:
             pass
+
+# ── MCP servers helpers ──────────────────────────────────────────────────────
+
+def get_mcp_servers() -> list[dict]:
+    """Return list of MCP servers from config.yaml."""
+    cfg = get_config()
+    raw = cfg.get("mcp_servers") or {}
+    if not isinstance(raw, dict):
+        return []
+    servers = []
+    for name, conf in raw.items():
+        if not isinstance(conf, dict):
+            continue
+        enabled = conf.get("enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.lower() not in ("false", "0", "no", "off", "")
+        else:
+            enabled = bool(enabled)
+        tools = conf.get("tools") or {}
+        tools_include = tools.get("include") or []
+        tools_exclude = tools.get("exclude") or []
+        if "url" in conf:
+            servers.append({
+                "name": name,
+                "type": "http",
+                "url": conf.get("url", ""),
+                "headers": conf.get("headers") or {},
+                "tools_include": tools_include if isinstance(tools_include, list) else [str(tools_include)],
+                "tools_exclude": tools_exclude if isinstance(tools_exclude, list) else [str(tools_exclude)],
+                "enabled": enabled,
+            })
+        else:
+            servers.append({
+                "name": name,
+                "type": "stdio",
+                "command": conf.get("command", ""),
+                "args": conf.get("args") or [],
+                "env": conf.get("env") or {},
+                "tools_include": tools_include if isinstance(tools_include, list) else [str(tools_include)],
+                "tools_exclude": tools_exclude if isinstance(tools_exclude, list) else [str(tools_exclude)],
+                "enabled": enabled,
+            })
+    return servers
+
+
+def save_mcp_server(name: str, server_config: dict) -> dict:
+    """Save or update an MCP server in config.yaml."""
+    if not name or not isinstance(name, str):
+        raise ValueError("Server name is required")
+    name = name.strip()
+    if not name:
+        raise ValueError("Server name is required")
+
+    config_path = _get_config_path()
+    cfg = _load_yaml_config_file(config_path)
+
+    if "mcp_servers" not in cfg or not isinstance(cfg.get("mcp_servers"), dict):
+        cfg["mcp_servers"] = {}
+
+    entry: dict = {}
+    server_type = str(server_config.get("type", "stdio")).strip().lower()
+
+    if server_type == "http":
+        url = str(server_config.get("url", "")).strip()
+        if not url:
+            raise ValueError("URL is required for HTTP MCP servers")
+        entry["url"] = url
+        headers = server_config.get("headers")
+        if isinstance(headers, dict) and headers:
+            entry["headers"] = headers
+    else:
+        command = str(server_config.get("command", "")).strip()
+        if not command:
+            raise ValueError("Command is required for stdio MCP servers")
+        entry["command"] = command
+        args = server_config.get("args")
+        if isinstance(args, list):
+            entry["args"] = [str(a) for a in args if a is not None]
+        env = server_config.get("env")
+        if isinstance(env, dict) and env:
+            entry["env"] = {str(k): str(v) for k, v in env.items() if v is not None}
+
+    tools_include = server_config.get("tools_include")
+    tools_exclude = server_config.get("tools_exclude")
+    if (isinstance(tools_include, list) and tools_include) or (isinstance(tools_exclude, list) and tools_exclude):
+        entry["tools"] = {}
+        if isinstance(tools_include, list) and tools_include:
+            entry["tools"]["include"] = [str(t) for t in tools_include if t is not None]
+        if isinstance(tools_exclude, list) and tools_exclude:
+            entry["tools"]["exclude"] = [str(t) for t in tools_exclude if t is not None]
+
+    enabled = server_config.get("enabled")
+    if enabled is not None:
+        entry["enabled"] = bool(enabled)
+
+    cfg["mcp_servers"][name] = entry
+    _save_yaml_config_file(config_path, cfg)
+    # Invalidate cache so next get_config() picks up the change
+    reload_config()
+    return {"ok": True, "name": name}
+
+
+def delete_mcp_server(name: str) -> dict:
+    """Delete an MCP server from config.yaml."""
+    if not name or not isinstance(name, str):
+        raise ValueError("Server name is required")
+    name = name.strip()
+    config_path = _get_config_path()
+    cfg = _load_yaml_config_file(config_path)
+    mcp_servers = cfg.get("mcp_servers") or {}
+    if not isinstance(mcp_servers, dict):
+        raise ValueError("No MCP servers configured")
+    if name not in mcp_servers:
+        raise ValueError(f'MCP server "{name}" not found')
+    del cfg["mcp_servers"][name]
+    if not cfg["mcp_servers"]:
+        del cfg["mcp_servers"]
+    _save_yaml_config_file(config_path, cfg)
+    reload_config()
+    return {"ok": True, "name": name}
+
+
+def reload_mcp_servers() -> dict:
+    """Shutdown all MCP servers and rediscover them. Returns status list."""
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, get_mcp_status
+        shutdown_mcp_servers()
+        discover_mcp_tools()
+        return {"ok": True, "status": get_mcp_status()}
+    except ImportError:
+        # MCP package not available
+        return {"ok": False, "error": "MCP support is not installed"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ── COHERE API KEY (from env or Hermes .env) ─────────────────────────────────
+_COHERE_API_KEY: str | None = None
+
+
+def get_cohere_api_key() -> str | None:
+    """Return the Cohere API key from env or Hermes .env file."""
+    global _COHERE_API_KEY
+    if _COHERE_API_KEY is not None:
+        return _COHERE_API_KEY or None
+    key = os.getenv("COHERE_API_KEY", "").strip()
+    if key:
+        _COHERE_API_KEY = key
+        return key
+    # Fallback: read from Hermes .env
+    try:
+        from api.profiles import get_active_hermes_home as _gah
+        hermes_env_path = _gah() / ".env"
+    except ImportError:
+        hermes_env_path = HOME / ".hermes" / ".env"
+    if hermes_env_path.exists():
+        try:
+            for line in hermes_env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip() == "COHERE_API_KEY":
+                        key = v.strip().strip('"').strip("'")
+                        if key:
+                            _COHERE_API_KEY = key
+                            return key
+        except Exception:
+            pass
+    _COHERE_API_KEY = ""
+    return None
+
 
 # ── SESSIONS in-memory cache (LRU OrderedDict) ───────────────────────────────
 SESSIONS: collections.OrderedDict = collections.OrderedDict()
