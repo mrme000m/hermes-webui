@@ -280,7 +280,12 @@ function _loadPersistedState() {
   if (_selectedSkills.size !== savedSkills.length) _saveSelectedSkills();
 
   _customPresets = _safeGetJson('trading-custom-presets', []);
-  _cohereApiKey = localStorage.getItem('trading-cohere-key') || '';
+  try {
+    _cohereApiKey = localStorage.getItem('trading-cohere-key') || '';
+  } catch (e) {
+    console.warn('[TradingUX] Cannot read cohere key from localStorage:', e);
+    _cohereApiKey = '';
+  }
   _symbolFavorites = new Set(_safeGetJson('trading-symbol-favorites', []));
   _symbolRecent = _safeGetJson('trading-symbol-recent', []);
 }
@@ -1251,6 +1256,7 @@ function quickAction(action) {
 
 // Shared Cohere v2/chat client. Never logs the API key.
 async function callCohere(systemPrompt, userContent, apiKey) {
+  console.log('[TradingUX] callCohere: sending request…');
   const res = await fetch('https://api.cohere.com/v2/chat', {
     method: 'POST',
     headers: {
@@ -1267,36 +1273,66 @@ async function callCohere(systemPrompt, userContent, apiKey) {
     })
   });
 
+  console.log('[TradingUX] callCohere: response status', res.status);
+
   if (!res.ok) {
     const body = await res.text().catch(() => '');
+    console.error('[TradingUX] callCohere: error body:', body.slice(0, 500));
     throw new Error(`Cohere ${res.status}: ${body.slice(0, 200)}`);
   }
 
   const data = await res.json();
-  const text = data.message?.content?.map(c => c.text).join('')
-    ?? data.text
-    ?? null;
+  console.log('[TradingUX] callCohere: response keys:', Object.keys(data));
 
-  if (!text) throw new Error('Empty response from Cohere');
+  // Cohere v2 returns message.content as an array of content parts
+  // Each part has { type: 'text', text: '...' }
+  let text = null;
+  if (Array.isArray(data.message?.content)) {
+    text = data.message.content.map(c => c.text || '').join('');
+  } else if (typeof data.message?.content === 'string') {
+    text = data.message.content;
+  } else if (typeof data.text === 'string') {
+    text = data.text;
+  }
+
+  console.log('[TradingUX] callCohere: extracted text length:', text?.length);
+  if (!text || !text.trim()) {
+    console.error('[TradingUX] callCohere: empty text, full response:', JSON.stringify(data, null, 2).slice(0, 1000));
+    throw new Error('Empty response from Cohere');
+  }
   return text.trim();
 }
 
 async function enhancePrompt() {
   const msgInput = document.getElementById('msg');
   const btn = document.getElementById('btnEnhance');
-  if (!msgInput || !msgInput.value.trim()) {
+  console.log('[TradingUX] enhancePrompt clicked');
+
+  if (!msgInput) {
+    console.warn('[TradingUX] msg input not found');
+    showToast('Composer not ready', 3000);
+    return;
+  }
+  if (!msgInput.value.trim()) {
+    console.log('[TradingUX] composer empty');
     showToast('Type a prompt first, then click Enhance', 3000);
     return;
   }
 
   const apiKey = _cohereApiKey;
+  console.log('[TradingUX] apiKey length:', apiKey ? apiKey.length : 0);
   if (!apiKey) {
+    console.log('[TradingUX] no api key');
     showToast('Set Cohere API key in Trading Pro → Enhance Settings', 4000);
     openCohereSettings();
     return;
   }
 
-  if (btn) { btn.disabled = true; btn.textContent = '✨ Enhancing…'; }
+  if (btn) {
+    btn.disabled = true;
+    const label = btn.querySelector('span');
+    if (label) label.textContent = 'Enhancing…';
+  }
 
   try {
     const currentPrompt = msgInput.value.trim();
@@ -1330,15 +1366,22 @@ Enhancement rules:
 
 Original prompt to enhance:`;
 
+    console.log('[TradingUX] calling Cohere…');
     const enhanced = await callCohere(systemPrompt, currentPrompt, apiKey);
+    console.log('[TradingUX] Cohere response length:', enhanced.length);
     setComposerValue(enhanced);
     showToast('✨ Prompt enhanced by Cohere', 3000);
 
   } catch (e) {
-    console.error('[TradingUX] Enhance failed:', e.message);
-    showToast('Enhance failed: ' + e.message, 4000);
+    console.error('[TradingUX] Enhance failed:', e);
+    const msg = e?.message || String(e);
+    showToast('Enhance failed: ' + msg, 4000);
   } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = '✨ Enhance'; }
+    if (btn) {
+      btn.disabled = false;
+      const label = btn.querySelector('span');
+      if (label) label.textContent = 'Enhance';
+    }
   }
 }
 
