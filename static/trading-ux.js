@@ -1249,6 +1249,38 @@ function quickAction(action) {
 
 /* ─────────────────────────  COHERE AUTO-ENHANCE  ───────────────────────── */
 
+// Shared Cohere v2/chat client. Never logs the API key.
+async function callCohere(systemPrompt, userContent, apiKey) {
+  const res = await fetch('https://api.cohere.com/v2/chat', {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: 'command-a-03-2025',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent }
+      ]
+    })
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Cohere ${res.status}: ${body.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  const text = data.message?.content?.map(c => c.text).join('')
+    ?? data.text
+    ?? null;
+
+  if (!text) throw new Error('Empty response from Cohere');
+  return text.trim();
+}
+
 async function enhancePrompt() {
   const msgInput = document.getElementById('msg');
   const btn = document.getElementById('btnEnhance');
@@ -1298,42 +1330,12 @@ Enhancement rules:
 
 Original prompt to enhance:`;
 
-    const res = await fetch('https://api.cohere.com/v2/chat', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'Authorization': `bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'command-a-03-2025',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: currentPrompt }
-        ]
-      })
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Cohere API error ${res.status}: ${err}`);
-    }
-
-    const data = await res.json();
-    let enhanced = '';
-    if (data.message?.content) {
-      enhanced = data.message.content.map(c => c.text).join('');
-    } else if (data.text) {
-      enhanced = data.text;
-    } else {
-      throw new Error('Unexpected Cohere response format');
-    }
-
-    setComposerValue(enhanced.trim());
+    const enhanced = await callCohere(systemPrompt, currentPrompt, apiKey);
+    setComposerValue(enhanced);
     showToast('✨ Prompt enhanced by Cohere', 3000);
 
   } catch (e) {
-    console.error('[TradingUX] Enhance failed:', e);
+    console.error('[TradingUX] Enhance failed:', e.message);
     showToast('Enhance failed: ' + e.message, 4000);
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = '✨ Enhance'; }
@@ -1804,44 +1806,14 @@ async function _enhancePresetModalWithCohere() {
   if (btn) { btn.disabled = true; btn.textContent = '✨ Enhancing\u2026'; }
 
   try {
-    const systemPrompt = `You are a trading prompt enhancement specialist. Your job is to improve trading-related prompt templates.\n\nAvailable TradingView Pine Script Skills:\n${skillsContext}\n\nEnhancement rules:\n1. Add specific skill names and parameters where relevant\n2. Include timeframe and symbol context (use {symbol} placeholder)\n3. Request structured output (JSON, bullet points, or clear sections)\n4. Add validation steps where appropriate\n5. Keep the original intent \u2014 do not change the user's goal\n6. Output ONLY the enhanced prompt text, no explanations\n\nUser instruction: ${instructions}\n\nOriginal prompt to enhance:`;
+    const systemPrompt = `You are a trading prompt enhancement specialist. Your job is to improve trading-related prompt templates.\n\nAvailable TradingView Pine Script Skills:\n${skillsContext}\n\nEnhancement rules:\n1. Add specific skill names and parameters where relevant\n2. Include timeframe and symbol context (use {symbol} placeholder)\n3. Request structured output (JSON, bullet points, or clear sections)\n4. Add validation steps where appropriate\n5. Keep the original intent — do not change the user's goal\n6. Output ONLY the enhanced prompt text, no explanations\n\nUser instruction: ${instructions}\n\nOriginal prompt to enhance:`;
 
-    const res = await fetch('https://api.cohere.com/v2/chat', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'Authorization': `bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'command-a-03-2025',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: currentPrompt }
-        ]
-      })
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Cohere API error ${res.status}: ${err}`);
-    }
-
-    const data = await res.json();
-    let enhanced = '';
-    if (data.message?.content) {
-      enhanced = data.message.content.map(c => c.text).join('');
-    } else if (data.text) {
-      enhanced = data.text;
-    } else {
-      throw new Error('Unexpected Cohere response format');
-    }
-
-    promptEl.value = enhanced.trim();
+    const enhanced = await callCohere(systemPrompt, currentPrompt, apiKey);
+    promptEl.value = enhanced;
     showToast('✨ Preset enhanced by Cohere', 3000);
 
   } catch (e) {
-    console.error('[PresetStudio] Enhance failed:', e);
+    console.error('[PresetStudio] Enhance failed:', e.message);
     showToast('Enhance failed: ' + e.message, 4000);
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = originalText; }
